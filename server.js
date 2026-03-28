@@ -100,31 +100,49 @@ async function runCollection(keyword = '杀戮尖塔') {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-//  SKILL: 攻略收集  (对话触发 — 用户说"收集攻略"等关键词时自动激活)
+//  SKILL SYSTEM — 读取 .claude/commands/*.md，用户输入 /skill-name 触发
 // ══════════════════════════════════════════════════════════════════════════
 
-// 触发收集的关键词 / 命令
-const COLLECTION_TRIGGERS = [
-  '/collect', '/收集', '/更新攻略', '/intel',
-  '帮我收集', '收集攻略', '抓取攻略', '更新攻略库', '更新知识库',
-  '搜集攻略', '采集攻略', '从贴吧', '从小红书收集',
-  'collect guides', 'collect spire', 'update knowledge',
-];
+const SKILLS_DIR = path.join(__dirname, '.claude', 'commands');
 
-// 支持的游戏关键词（用于从用户消息中提取收集目标）
-const GAME_KEYWORDS = ['杀戮尖塔', 'slay the spire', 'slaythespire'];
-
-function isCollectionIntent(text) {
-  const lower = text.toLowerCase().trim();
-  return COLLECTION_TRIGGERS.some(t => lower.includes(t.toLowerCase()));
+/**
+ * 读取 .claude/commands/ 下所有 .md 文件，返回 skill 列表
+ */
+function listSkills() {
+  try {
+    return fs.readdirSync(SKILLS_DIR)
+      .filter(f => f.endsWith('.md'))
+      .map(f => {
+        const name = f.replace(/\.md$/, '');
+        const lines = fs.readFileSync(path.join(SKILLS_DIR, f), 'utf8').split('\n');
+        const desc  = lines.find(l => l.trim() && !l.startsWith('#')) || name;
+        return { name, description: desc.slice(0, 120) };
+      });
+  } catch (_) { return []; }
 }
 
-function extractCollectionKeyword(text) {
-  const lower = text.toLowerCase();
-  for (const name of GAME_KEYWORDS) {
-    if (lower.includes(name.toLowerCase())) return name;
-  }
-  return '杀戮尖塔';
+/**
+ * Skill handlers — 每个 key 对应 .claude/commands/{key}.md 文件名
+ * 新增 skill 只需：① 放一个 .md 文件 ② 在这里注册处理函数
+ */
+const SKILL_HANDLERS = {
+  'collect-spire-guides': async (send, _args) => {
+    await runCollectionAsSkill('杀戮尖塔', send);
+  },
+};
+
+/**
+ * 检测用户消息是否为 slash command，并调度对应 skill
+ * @returns {boolean} true 表示已处理，不再走 AI 路由
+ */
+async function dispatchSkill(text, send) {
+  if (!text.trim().startsWith('/')) return false;
+  const [cmd, ...args] = text.trim().slice(1).split(/\s+/);
+  const handler = SKILL_HANDLERS[cmd.toLowerCase()];
+  if (!handler) return false;
+  console.log('[Skill] Dispatching:', cmd);
+  await handler(send, args);
+  return true;
 }
 
 /**
@@ -482,6 +500,13 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── Skills list ──
+  if (url.pathname === '/api/skills') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ skills: listSkills() }));
+    return;
+  }
+
   // ── Vision: direct image analysis endpoint ──
   if (url.pathname === '/api/vision' && req.method === 'POST') {
     const body = await readBody(req);
@@ -597,19 +622,14 @@ wss.on('connection', (client) => {
     const imageUrls = msg.images  || [];
 
     // ────────────────────────────────────────────────────────────────────
-    // SKILL — 检测对话中的收集意图，优先于 AI 路由
-    // 触发词示例："/collect"、"帮我收集攻略"、"更新知识库" 等
+    // SKILL — slash command 优先，/skill-name 触发对应 .claude/commands/*.md
     // ────────────────────────────────────────────────────────────────────
-    const lastUser = rawMsgs.filter(m => m.role === 'user').slice(-1)[0];
+    const lastUser     = rawMsgs.filter(m => m.role === 'user').slice(-1)[0];
     const lastUserText = Array.isArray(lastUser?.content)
       ? lastUser.content.filter(b => b.type === 'text').map(b => b.text).join(' ')
       : (lastUser?.content || msg.text || '');
 
-    if (isCollectionIntent(lastUserText)) {
-      const keyword = extractCollectionKeyword(lastUserText);
-      await runCollectionAsSkill(keyword, send);
-      return; // 不再走 AI 路由
-    }
+    if (await dispatchSkill(lastUserText, send)) return;
 
     // ────────────────────────────────────────────────────────────────────
     // RAG — retrieve guides regardless of routing path

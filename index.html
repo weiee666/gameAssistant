@@ -501,9 +501,15 @@ input[type=file]#file-in{display:none}
 
     <div id="attach-bar" style="display:none"></div>
 
+    <!-- Skill slash-command suggestions -->
+    <div id="skill-suggestions" style="
+      display:none;position:absolute;bottom:100%;left:0;right:0;
+      background:var(--dark2);border:2px solid var(--green);
+      z-index:50;max-height:200px;overflow-y:auto;"></div>
+
     <div id="action-bar">
       <div id="input-row">
-        <textarea id="msg-input" placeholder="// 输入指令... (Enter 发送)" rows="1"></textarea>
+        <textarea id="msg-input" placeholder="// 输入指令... 或 /skill-name (Enter 发送)" rows="1"></textarea>
       </div>
       <div style="display:flex;gap:6px;align-items:center">
         <!-- Figma: 3 action buttons — red / gray / green -->
@@ -1195,6 +1201,60 @@ function recShortcut(){
 }
 
 /* ══════════════════════════════════════════════
+   SKILL SLASH-COMMAND SUGGESTIONS
+══════════════════════════════════════════════ */
+let _skillList = [];
+
+async function loadSkills() {
+  try {
+    const r = await fetch('/api/skills');
+    const d = await r.json();
+    _skillList = d.skills || [];
+  } catch(_) {}
+}
+
+function showSkillSuggestions(query) {
+  const box = document.getElementById('skill-suggestions');
+  const q = query.toLowerCase();
+  const matches = _skillList.filter(s => s.name.includes(q));
+  if (!matches.length) { box.style.display='none'; return; }
+  box.style.display = 'block';
+  box.innerHTML = matches.map(s => `
+    <div onclick="pickSkill('/${s.name}')" style="
+      padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--gray);
+      font-size:7px;letter-spacing:1px;"
+      onmouseover="this.style.background='var(--green-dim)'"
+      onmouseout="this.style.background=''">
+      <span style="color:var(--green-hi)">/${s.name}</span>
+      <span style="color:var(--off);margin-left:8px">${s.description}</span>
+    </div>`).join('');
+}
+
+function pickSkill(cmd) {
+  const inp = document.getElementById('msg-input');
+  inp.value = cmd;
+  document.getElementById('skill-suggestions').style.display = 'none';
+  inp.focus();
+}
+
+function hideSkillSuggestions() {
+  setTimeout(() => {
+    document.getElementById('skill-suggestions').style.display = 'none';
+  }, 150);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  const inp = document.getElementById('msg-input');
+  if (!inp) return;
+  inp.addEventListener('input', () => {
+    const v = inp.value;
+    if (v.startsWith('/')) showSkillSuggestions(v.slice(1));
+    else document.getElementById('skill-suggestions').style.display = 'none';
+  });
+  inp.addEventListener('blur', hideSkillSuggestions);
+});
+
+/* ══════════════════════════════════════════════
    INTEL / RAG PANEL
 ══════════════════════════════════════════════ */
 let _intelPollTimer = null;
@@ -1305,6 +1365,7 @@ renderCurrentAv();
 buildAvGrid();
 updateShortcutDisplay();
 document.getElementById('interval-input').value=cfg.interval;
+loadSkills();
 // Load RAG count from API on startup
 fetch('/api/status').then(r=>r.json()).then(d=>{
   const ragCount = document.getElementById('sb-rag-count');
