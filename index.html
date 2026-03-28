@@ -906,6 +906,18 @@ function connect() {
       showToast('// RAG: ' + (msg.message || '已检索攻略库'), 2500);
       return;
     }
+    if (msg.type==='skill.start') {
+      setAvStatus('SKILL: INTEL AGENT ACTIVE');
+      showToast('// SKILL: 攻略收集中...', 3000);
+      return;
+    }
+    if (msg.type==='skill.done') {
+      setAvStatus('SKILL COMPLETE // INTEL DB UPDATED');
+      const ragCount = document.getElementById('sb-rag-count');
+      if (ragCount && msg.total != null) ragCount.textContent = msg.total + ' 条';
+      showToast(`// INTEL: 新增 ${msg.saved} 条，共 ${msg.total} 条攻略`, 4000);
+      return;
+    }
     if (msg.type==='delta') {
       if (!st.streamEl) st.streamEl = addMsg('assistant','',true);
       st.streamText += msg.text;

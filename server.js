@@ -6,6 +6,16 @@ const fs   = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
 
+// ── Load .env (no extra dependency needed) ────────────────────────────────
+try {
+  fs.readFileSync(path.join(__dirname, '.env'), 'utf8')
+    .split('\n')
+    .forEach(line => {
+      const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.+?)\s*$/);
+      if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^['"]|['"]$/g, '');
+    });
+} catch (_) {}
+
 // ── Config ─────────────────────────────────────────────────────────────────
 const PORT         = process.env.PORT || 7788;
 const ZENMUX_URL   = 'https://zenmux.ai/api/v1/chat/completions';
@@ -87,6 +97,120 @@ async function runCollection(keyword = '杀戮尖塔') {
   } finally {
     collectionState.running = false;
   }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  SKILL: 攻略收集  (对话触发 — 用户说"收集攻略"等关键词时自动激活)
+// ══════════════════════════════════════════════════════════════════════════
+
+// 触发收集的关键词 / 命令
+const COLLECTION_TRIGGERS = [
+  '/collect', '/收集', '/更新攻略', '/intel',
+  '帮我收集', '收集攻略', '抓取攻略', '更新攻略库', '更新知识库',
+  '搜集攻略', '采集攻略', '从贴吧', '从小红书收集',
+  'collect guides', 'collect spire', 'update knowledge',
+];
+
+// 支持的游戏关键词（用于从用户消息中提取收集目标）
+const GAME_KEYWORDS = ['杀戮尖塔', 'slay the spire', 'slaythespire'];
+
+function isCollectionIntent(text) {
+  const lower = text.toLowerCase().trim();
+  return COLLECTION_TRIGGERS.some(t => lower.includes(t.toLowerCase()));
+}
+
+function extractCollectionKeyword(text) {
+  const lower = text.toLowerCase();
+  for (const name of GAME_KEYWORDS) {
+    if (lower.includes(name.toLowerCase())) return name;
+  }
+  return '杀戮尖塔';
+}
+
+/**
+ * Run guide collection and stream real-time progress back as chat deltas.
+ * This is the in-chat version of runCollection() — output goes to the
+ * WebSocket client instead of collectionState.log only.
+ */
+async function runCollectionAsSkill(keyword, send) {
+  // Guard
+  if (!scraper || !tidb) {
+    send({ type: 'delta', text: '⚠ 攻略收集模块未启用。\n请确认已安装依赖：`npm install mysql2 cheerio`\n并配置好 TiDB 连接环境变量。' });
+    send({ type: 'done' });
+    return;
+  }
+  if (collectionState.running) {
+    send({ type: 'delta', text: `⚠ 已有收集任务正在进行中（进度 ${collectionState.progress}/${collectionState.total}），请稍后再试。` });
+    send({ type: 'done' });
+    return;
+  }
+
+  // Init state
+  collectionState.running  = true;
+  collectionState.progress = 0;
+  collectionState.total    = 2;
+  collectionState.found    = 0;
+  collectionState.log      = [`[${new Date().toISOString()}] Skill 触发收集 "${keyword}"`];
+
+  send({ type: 'skill.start', skill: 'collect-guides' });
+  send({ type: 'delta', text: `◈ **INTEL AGENT 已激活**\n\n搜索目标：「${keyword}」\n来源：百度贴吧 + 小红书\n\n` });
+
+  let tiebaItems = [];
+  let xhsItems   = [];
+
+  // ── 百度贴吧 ──
+  send({ type: 'delta', text: '▶ 正在抓取**百度贴吧**...\n' });
+  try {
+    tiebaItems = await scraper.scrapeTieba(`${keyword}攻略`);
+    send({ type: 'delta', text: `  ✓ 获取 ${tiebaItems.length} 条内容\n` });
+    collectionState.log.push(`贴吧: ${tiebaItems.length} 条`);
+  } catch (e) {
+    send({ type: 'delta', text: `  ✗ 抓取失败: ${e.message}\n` });
+    collectionState.log.push(`贴吧错误: ${e.message}`);
+  }
+  collectionState.progress = 1;
+
+  // ── 小红书 ──
+  send({ type: 'delta', text: '▶ 正在抓取**小红书**...\n' });
+  try {
+    xhsItems = await scraper.scrapeXiaohongshu(`${keyword}攻略`);
+    send({ type: 'delta', text: `  ✓ 获取 ${xhsItems.length} 条内容\n` });
+    collectionState.log.push(`小红书: ${xhsItems.length} 条`);
+  } catch (e) {
+    send({ type: 'delta', text: `  ✗ 抓取失败: ${e.message}\n` });
+    collectionState.log.push(`小红书错误: ${e.message}`);
+  }
+  collectionState.progress = 2;
+
+  // ── 保存到 TiDB ──
+  const all = [...tiebaItems, ...xhsItems];
+  send({ type: 'delta', text: `\n▶ 正在保存到 TiDB（共 ${all.length} 条）...\n` });
+  let saved = 0;
+  for (const guide of all) {
+    try {
+      const id = await tidb.insertGuide(guide);
+      if (id > 0) saved++;
+    } catch (e) { /* duplicate or error, skip */ }
+  }
+
+  collectionState.found   = saved;
+  collectionState.running = false;
+  collectionState.lastRun = new Date().toISOString();
+  collectionState.log.push(`✓ 保存 ${saved} 条`);
+
+  // ── 汇报结果 ──
+  const counts = await tidb.countGuides().catch(() => []);
+  const total  = counts.reduce((s, c) => s + parseInt(c.cnt), 0);
+  const breakdown = counts.map(c => {
+    const src = c.source === 'tieba' ? '百度贴吧' : c.source === 'xiaohongshu' ? '小红书' : c.source;
+    return `${src} ${c.cnt} 条`;
+  }).join(' / ');
+
+  send({ type: 'delta', text: `  ✓ 新增 **${saved}** 条（跳过 ${all.length - saved} 条重复）\n` });
+  send({ type: 'delta', text: `\n---\n📚 **知识库现状**：共 **${total}** 条攻略（${breakdown || '暂无数据'}）\n\n` });
+  send({ type: 'delta', text: `RAG 已就绪 — 现在直接问我关于「${keyword}」的问题，我会参考这些攻略来回答！` });
+  send({ type: 'skill.done', skill: 'collect-guides', saved, total });
+  send({ type: 'done' });
 }
 
 // ── Shared fetch helper ───────────────────────────────────────────────────
@@ -473,15 +597,26 @@ wss.on('connection', (client) => {
     const imageUrls = msg.images  || [];
 
     // ────────────────────────────────────────────────────────────────────
+    // SKILL — 检测对话中的收集意图，优先于 AI 路由
+    // 触发词示例："/collect"、"帮我收集攻略"、"更新知识库" 等
+    // ────────────────────────────────────────────────────────────────────
+    const lastUser = rawMsgs.filter(m => m.role === 'user').slice(-1)[0];
+    const lastUserText = Array.isArray(lastUser?.content)
+      ? lastUser.content.filter(b => b.type === 'text').map(b => b.text).join(' ')
+      : (lastUser?.content || msg.text || '');
+
+    if (isCollectionIntent(lastUserText)) {
+      const keyword = extractCollectionKeyword(lastUserText);
+      await runCollectionAsSkill(keyword, send);
+      return; // 不再走 AI 路由
+    }
+
+    // ────────────────────────────────────────────────────────────────────
     // RAG — retrieve guides regardless of routing path
     // ────────────────────────────────────────────────────────────────────
     let ragCtx = null;
     if (rag) {
-      const lastUser = rawMsgs.filter(m => m.role === 'user').slice(-1)[0];
-      const lastText = Array.isArray(lastUser?.content)
-        ? lastUser.content.filter(b => b.type === 'text').map(b => b.text).join(' ')
-        : (lastUser?.content || '');
-      ragCtx = await rag.retrieveContext(lastText).catch(e => {
+      ragCtx = await rag.retrieveContext(lastUserText).catch(e => {
         console.warn('[RAG] Retrieval failed:', e.message);
         return null;
       });
